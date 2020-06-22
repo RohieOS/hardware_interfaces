@@ -92,12 +92,14 @@ static std::unique_ptr<Obd2SensorStore> fillDefaultObd2Frame(size_t numVendorInt
     return sensorStore;
 }
 
-EmulatedVehicleHal::EmulatedVehicleHal(VehiclePropertyStore* propStore, VehicleHalClient* client)
+EmulatedVehicleHal::EmulatedVehicleHal(VehiclePropertyStore* propStore, VehicleHalClient* client,
+                                       EmulatedUserHal* emulatedUserHal)
     : mPropStore(propStore),
       mHvacPowerProps(std::begin(kHvacPowerProperties), std::end(kHvacPowerProperties)),
       mRecurrentTimer(std::bind(&EmulatedVehicleHal::onContinuousPropertyTimer, this,
                                 std::placeholders::_1)),
-      mVehicleClient(client) {
+      mVehicleClient(client),
+      mEmulatedUserHal(emulatedUserHal) {
     initStaticConfig();
     for (size_t i = 0; i < arraysize(kVehicleProperties); i++) {
         mPropStore->registerProperty(kVehicleProperties[i].config);
@@ -134,6 +136,8 @@ void EmulatedVehicleHal::getAllPropertiesOverride() {
 VehicleHal::VehiclePropValuePtr EmulatedVehicleHal::get(
         const VehiclePropValue& requestedPropValue, StatusCode* outStatus) {
     auto propId = requestedPropValue.prop;
+    ALOGV("get(%d)", propId);
+
     auto& pool = *getValuePool();
     VehiclePropValuePtr v = nullptr;
 
@@ -147,6 +151,26 @@ VehicleHal::VehiclePropValuePtr EmulatedVehicleHal::get(
             *outStatus = fillObd2DtcInfo(v.get());
             break;
         default:
+            if (mEmulatedUserHal != nullptr && mEmulatedUserHal->isSupported(propId)) {
+                ALOGI("get(): getting value for prop %d from User HAL", propId);
+                const auto& ret = mEmulatedUserHal->onGetProperty(propId);
+                if (!ret.ok()) {
+                    ALOGE("get(): User HAL returned error: %s", ret.error().message().c_str());
+                    *outStatus = StatusCode(ret.error().code());
+                } else {
+                    auto value = ret.value().get();
+                    if (value != nullptr) {
+                        ALOGI("get(): User HAL returned value: %s", toString(*value).c_str());
+                        v = getValuePool()->obtain(*value);
+                        *outStatus = StatusCode::OK;
+                    } else {
+                        ALOGE("get(): User HAL returned null value");
+                        *outStatus = StatusCode::INTERNAL_ERROR;
+                    }
+                }
+                break;
+            }
+
             auto internalPropValue = mPropStore->readValueOrNull(requestedPropValue);
             if (internalPropValue != nullptr) {
                 v = getValuePool()->obtain(*internalPropValue);
@@ -175,9 +199,7 @@ StatusCode EmulatedVehicleHal::set(const VehiclePropValue& propValue) {
         // here, since we never send the control signal back, the value of 'updateStatus' flag
         // does not matter here.
         auto status = mVehicleClient->setProperty(propValue, updateStatus);
-        if (status != StatusCode::OK) {
-            return status;
-        }
+        return status;
     } else if (mHvacPowerProps.count(propValue.prop)) {
         auto hvacPowerOn = mPropStore->readValueOrNull(
             toInt(VehicleProperty::HVAC_POWER_ON),
